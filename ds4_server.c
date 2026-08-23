@@ -394,6 +394,96 @@ static bool json_skip_value(const char **p) {
     return json_skip_value_depth(p, 0);
 }
 
+/* ---- Runtime directional steering: request-side parsing -----------------
+ *
+ * A request may carry {"steering": {"profile": "name", "attn": F, "ffn": F}}
+ * (also accepted by POST /v1/steering for the server default). "name" is an
+ * alias of "profile". Every key is optional: an absent axis/profile inherits
+ * the server default when the job is applied (steering_apply_job). */
+
+/* Same range the CLI accepts for --dir-steering-*; useful values are
+ * |scale| <= ~3 (dir-steering/README.md), larger ones degrade the model. */
+#define STEERING_SCALE_LIMIT 100.0f
+/* Profile names are bare file names under --steering-dir: no separators, no
+ * leading dot (hides "." / ".." / dotfiles), printable ASCII, and short
+ * enough for the engine's per-session cache key. */
+#define STEERING_NAME_MAX 63
+
+static bool steering_name_valid(const char *name) {
+    if (!name || !name[0] || name[0] == '.') return false;
+    const size_t n = strlen(name);
+    if (n > STEERING_NAME_MAX) return false;
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)name[i];
+        if (c == '/' || c == '\\' || c < 0x20 || c >= 0x7f) return false;
+    }
+    return true;
+}
+
+static bool steering_scale_valid(double v) {
+    return isfinite(v) && v >= -STEERING_SCALE_LIMIT && v <= STEERING_SCALE_LIMIT;
+}
+
+/* Parse the steering object at *p. Sets *attn_set / *ffn_set for the axes
+ * present and replaces *name (heap, caller owns) when a profile key is
+ * present. allow_clear lets "" through as the explicit "no profile" value
+ * (POST /v1/steering); request bodies must name a real profile. Unknown
+ * keys are skipped like everywhere else in these parsers. Returns false on
+ * malformed JSON, a non-finite / out-of-range scale, or a bad name. */
+static bool json_parse_steering_obj(const char **p, float *attn, bool *attn_set,
+                                    float *ffn, bool *ffn_set, char **name,
+                                    bool allow_clear) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *k = NULL;
+        if (!json_string(p, &k)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(k);
+            return false;
+        }
+        (*p)++;
+        bool ok = true;
+        if (!strcmp(k, "attn") || !strcmp(k, "ffn")) {
+            double v = 0.0;
+            ok = json_number(p, &v) && steering_scale_valid(v);
+            if (ok && k[0] == 'a') {
+                *attn = (float)v;
+                *attn_set = true;
+            } else if (ok) {
+                *ffn = (float)v;
+                *ffn_set = true;
+            }
+        } else if (!strcmp(k, "profile") || !strcmp(k, "name")) {
+            char *v = NULL;
+            ok = json_string(p, &v);
+            if (ok && !(steering_name_valid(v) || (allow_clear && !v[0]))) {
+                free(v);
+                ok = false;
+            }
+            if (ok) {
+                free(*name);
+                *name = v;
+            }
+        } else {
+            ok = json_skip_value(p);
+        }
+        free(k);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+        }
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 static bool json_raw_value(const char **p, char **out) {
     json_ws(p);
     const char *start = *p;
@@ -697,6 +787,16 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* Per-request directional steering override ("steering" object in the
+     * body). The *_set flags mark which axes the request overrides; absent
+     * axes and an absent profile inherit the server default when the job is
+     * applied (steering_apply_job). steering_name is a bare file name under
+     * --steering-dir or the launch profile's basename. */
+    float steering_attn;
+    float steering_ffn;
+    bool steering_attn_set;
+    bool steering_ffn_set;
+    char *steering_name;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -838,6 +938,7 @@ static void request_free(request *r) {
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
+    free(r->steering_name);
     memset(r, 0, sizeof(*r));
 }
 
@@ -3041,6 +3142,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->temperature = (float)v;
             r->temperature_set = true;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name, false)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3132,7 +3240,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* e == NULL only in the parser unit tests (no model): skip tokenizing. */
+    if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -3259,6 +3368,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             }
             r->temperature = (float)v;
             r->temperature_set = true;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name, false)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3348,7 +3464,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* e == NULL only in the parser unit tests (no model): skip tokenizing. */
+    if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -4159,6 +4276,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->temperature = (float)v;
             r->temperature_set = true;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name, false)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4285,7 +4409,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* e == NULL only in the parser unit tests (no model): skip tokenizing. */
+    if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -4383,6 +4508,13 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->temperature = (float)v;
             r->temperature_set = true;
+        } else if (!strcmp(key, "steering")) {
+            if (!json_parse_steering_obj(&p, &r->steering_attn, &r->steering_attn_set,
+                                         &r->steering_ffn, &r->steering_ffn_set,
+                                         &r->steering_name, false)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4475,7 +4607,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     chat_msgs_push(&msgs, user_msg);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    /* e == NULL only in the parser unit tests (no model): skip tokenizing. */
+    if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(prompt);
     return true;
@@ -8437,6 +8570,14 @@ struct server_slot {
     int decode_token;
     int decode_rc;
     char decode_err[160];
+
+    /* Steering this slot's session currently runs under (what the last job
+     * applied), for GET /v1/steering. Written by the slot's worker and read
+     * by HTTP threads under server.steering_mu. */
+    char *steering_name;
+    float steering_attn;
+    float steering_ffn;
+    bool steering_loaded;
 };
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -8477,6 +8618,31 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+
+    /* Runtime directional steering.
+     *  - steering_dir: the only place request-named profiles are loaded from
+     *    (bare file names, validated at parse time). NULL disables names
+     *    other than the launch profile.
+     *  - steering_launch_*: the --dir-steering-* configuration; immutable.
+     *    The launch profile is addressable by its basename from any request.
+     *  - steering_default_*: the server-wide baseline every job applies
+     *    unless its request overrides an axis or the profile. Starts as the
+     *    launch configuration, changed by POST /v1/steering, reset by DELETE.
+     *    Guarded by steering_mu (HTTP threads write, workers read), which
+     *    also guards the per-slot reporting fields in server_slot.
+     *  - steering_supported: false on the CPU backend / GLM, where the engine
+     *    setters are unavailable; explicit steering requests then get a 400
+     *    instead of being silently ignored. */
+    const char *steering_dir;
+    char *steering_launch_name;
+    char *steering_launch_path;
+    float steering_launch_attn;
+    float steering_launch_ffn;
+    char *steering_default_name;
+    float steering_default_attn;
+    float steering_default_ffn;
+    bool steering_supported;
+    pthread_mutex_t steering_mu;
 };
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -11172,6 +11338,119 @@ static uint64_t server_next_sequence(server *s) {
     return seq;
 }
 
+/* ---- Runtime directional steering: per-job application ------------------ */
+
+/* Resolve a profile name to the file it is loaded from on a cache miss. The
+ * launch profile (--dir-steering-file) is addressable by its basename from
+ * anywhere; every other name must be a bare file name under --steering-dir
+ * (validated at parse time, re-checked here since this also serves the admin
+ * endpoints). Reads only immutable server fields, so no lock is needed.
+ * Returns a heap path, or NULL with err filled. */
+static char *steering_resolve_profile(const server *s, const char *name,
+                                      char *err, size_t errlen) {
+    /* The launch profile is operator-supplied: it resolves even when its
+     * basename would not pass the request-side name rules (a dotfile, a
+     * non-ASCII name), so launch steering keeps working as the default. */
+    if (name && name[0] && s->steering_launch_name && !strcmp(name, s->steering_launch_name)) {
+        return xstrdup(s->steering_launch_path);
+    }
+    if (!steering_name_valid(name)) {
+        snprintf(err, errlen, "invalid steering profile name");
+        return NULL;
+    }
+    if (s->steering_dir && s->steering_dir[0]) {
+        const size_t need = strlen(s->steering_dir) + 1 + strlen(name) + 1;
+        char *path = xmalloc(need);
+        snprintf(path, need, "%s/%s", s->steering_dir, name);
+        return path;
+    }
+    snprintf(err, errlen,
+             "unknown steering profile '%s' (server started without --steering-dir)",
+             name);
+    return NULL;
+}
+
+/* Apply the job's effective steering to the slot's session before its first
+ * forward pass: the request overrides the server default per axis and for
+ * the profile, everything else inherits it. This is the whole "per-request
+ * hot swap": the engine reads the profile pointer and scales fresh on every
+ * forward, a cached profile is a pointer swap, a new one is loaded into the
+ * session's cache on first use, and an unchanged state is a few compares.
+ * Runs on the slot's worker under inference_mu, so it never races an eval of
+ * that session (batched mode included: the decode worker only touches
+ * sessions under the same lock). In-flight generations are unaffected; the
+ * next job picks up whatever the defaults say then.
+ * Returns 0, or an HTTP status with err filled: 400 for a bad request, 500
+ * when the server default itself cannot be applied. */
+static int steering_apply_job(server *s, server_slot *slot, job *j,
+                              char *err, size_t errlen) {
+    const request *r = &j->req;
+    const bool explicit_req = r->steering_name || r->steering_attn_set || r->steering_ffn_set;
+    if (!s->steering_supported) {
+        /* CPU backend / GLM: launch steering, if any, is engine-wide and
+         * already active; there is nothing per-request to apply. */
+        if (!explicit_req) return 0;
+        snprintf(err, errlen, "runtime steering is only available on the GPU backend");
+        return 400;
+    }
+
+    pthread_mutex_lock(&s->steering_mu);
+    char *name = xstrdup(r->steering_name ? r->steering_name :
+                         s->steering_default_name ? s->steering_default_name : "");
+    float attn = r->steering_attn_set ? r->steering_attn : s->steering_default_attn;
+    float ffn = r->steering_ffn_set ? r->steering_ffn : s->steering_default_ffn;
+    pthread_mutex_unlock(&s->steering_mu);
+
+    char serr[200];
+    serr[0] = '\0';
+    char *path = NULL;
+    int rc = 0;
+    if (name[0]) {
+        path = steering_resolve_profile(s, name, serr, sizeof(serr));
+        if (!path) rc = 1;
+    } else if (attn != 0.0f || ffn != 0.0f) {
+        /* No profile anywhere. A request that explicitly asked for strength
+         * is told it named no directions; an inherited default without a
+         * profile simply means "steering off" — the scales are meaningless
+         * without directions and must never fail an unrelated request. */
+        if (r->steering_attn_set || r->steering_ffn_set) {
+            snprintf(serr, sizeof(serr),
+                     "steering scales given but no profile is active: pass steering.profile "
+                     "or start the server with --dir-steering-file");
+            rc = 1;
+        } else {
+            attn = 0.0f;
+            ffn = 0.0f;
+        }
+    }
+    float cur_attn = 0.0f, cur_ffn = 0.0f;
+    bool loaded = false;
+    if (rc == 0) {
+        pthread_mutex_lock(&s->inference_mu);
+        rc = ds4_session_steering_select(slot->session, name[0] ? name : NULL, path,
+                                         attn, ffn, serr, sizeof(serr));
+        if (rc == 0) ds4_session_get_steering(slot->session, &cur_attn, &cur_ffn, &loaded);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+    free(path);
+    if (rc != 0) {
+        snprintf(err, errlen, "%s", serr);
+        free(name);
+        return explicit_req ? 400 : 500;
+    }
+
+    /* Record what this slot now runs under, for GET /v1/steering. */
+    pthread_mutex_lock(&s->steering_mu);
+    free(slot->steering_name);
+    slot->steering_name = name[0] ? name : NULL;
+    slot->steering_attn = cur_attn;
+    slot->steering_ffn = cur_ffn;
+    slot->steering_loaded = loaded;
+    pthread_mutex_unlock(&s->steering_mu);
+    if (!name[0]) free(name);
+    return 0;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -11187,6 +11466,14 @@ static uint64_t server_next_sequence(server *s) {
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    /* Steering is per request: resolve and apply it before any forward. */
+    {
+        const int code = steering_apply_job(s, slot, j, err, sizeof(err));
+        if (code != 0) {
+            http_error(j->fd, s->enable_cors, code, err);
+            return;
+        }
+    }
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -12790,6 +13077,223 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* ---- Runtime directional steering: admin endpoints -----------------------
+ *
+ *   GET    /v1/steering           server default + what each slot runs under
+ *   POST   /v1/steering           {"profile":NAME|"", "attn":F, "ffn":F}
+ *                                 change the server default for later jobs
+ *   DELETE /v1/steering           reset the default to the launch config
+ *   GET    /v1/steering/profiles  files under --steering-dir (+ launch file)
+ *
+ * These never touch a session: they only edit the server default under
+ * steering_mu. Each job applies its effective steering to its own slot in
+ * steering_apply_job, so an in-flight generation keeps the steering it
+ * started with and the next job picks up the new default. Per-request
+ * overrides ride in the request body ("steering" object) and win over the
+ * default for that one request. Vectors are not uploaded over HTTP: a
+ * profile is a file the server can read (see dir-steering/README.md). */
+
+/* Byte size of a valid profile file for the loaded model; 0 when unknown
+ * (no engine, e.g. unit tests), which disables the size check. */
+static uint64_t steering_profile_bytes(const server *s) {
+    if (!s->engine) return 0;
+    const int nl = ds4_engine_layer_count(s->engine);
+    const int ne = ds4_engine_embd_dim(s->engine);
+    if (nl <= 0 || ne <= 0) return 0;
+    return (uint64_t)nl * (uint64_t)ne * sizeof(float);
+}
+
+static bool steering_send_state(server *s, int fd) {
+    buf b = {0};
+    pthread_mutex_lock(&s->steering_mu);
+    buf_printf(&b, "{\"object\":\"steering\",\"supported\":%s,\"steering_dir\":",
+               s->steering_supported ? "true" : "false");
+    if (s->steering_dir) json_escape(&b, s->steering_dir); else buf_puts(&b, "null");
+    buf_puts(&b, ",\"launch_profile\":");
+    if (s->steering_launch_name) json_escape(&b, s->steering_launch_name);
+    else buf_puts(&b, "null");
+    buf_puts(&b, ",\"default\":{\"profile\":");
+    if (s->steering_default_name) json_escape(&b, s->steering_default_name);
+    else buf_puts(&b, "null");
+    buf_printf(&b, ",\"attn\":%g,\"ffn\":%g},\"slots\":[",
+               (double)s->steering_default_attn, (double)s->steering_default_ffn);
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        if (i) buf_putc(&b, ',');
+        buf_printf(&b, "{\"id\":%d,\"profile\":", slot->id);
+        if (slot->steering_name) json_escape(&b, slot->steering_name);
+        else buf_puts(&b, "null");
+        buf_printf(&b, ",\"attn\":%g,\"ffn\":%g,\"loaded\":%s}",
+                   (double)slot->steering_attn, (double)slot->steering_ffn,
+                   slot->steering_loaded ? "true" : "false");
+    }
+    buf_puts(&b, "]}\n");
+    pthread_mutex_unlock(&s->steering_mu);
+    const bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static void steering_profile_json(buf *b, const char *name, const char *path,
+                                  uint64_t want, bool launch) {
+    struct stat st;
+    const bool have = path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    buf_puts(b, "{\"name\":");
+    json_escape(b, name);
+    if (have) {
+        buf_printf(b, ",\"bytes\":%llu,\"valid\":%s",
+                   (unsigned long long)st.st_size,
+                   (want == 0 || (uint64_t)st.st_size == want) ? "true" : "false");
+    } else {
+        buf_puts(b, ",\"bytes\":null,\"valid\":false");
+    }
+    buf_printf(b, ",\"launch\":%s}", launch ? "true" : "false");
+}
+
+static bool steering_send_profiles(server *s, int fd) {
+    const uint64_t want = steering_profile_bytes(s);
+    buf b = {0};
+    buf_puts(&b, "{\"object\":\"list\",\"steering_dir\":");
+    if (s->steering_dir) json_escape(&b, s->steering_dir); else buf_puts(&b, "null");
+    buf_printf(&b, ",\"expected_bytes\":%llu,\"data\":[", (unsigned long long)want);
+    int n = 0;
+    if (s->steering_launch_name) {
+        steering_profile_json(&b, s->steering_launch_name, s->steering_launch_path, want, true);
+        n++;
+    }
+    if (s->steering_dir && s->steering_dir[0]) {
+        DIR *d = opendir(s->steering_dir);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                /* Skips ".", "..", dotfiles and anything a request could not
+                 * name anyway; the launch profile resolves to its own path. */
+                if (!steering_name_valid(de->d_name)) continue;
+                if (s->steering_launch_name && !strcmp(de->d_name, s->steering_launch_name)) continue;
+                char err[64];
+                char *path = steering_resolve_profile(s, de->d_name, err, sizeof(err));
+                if (!path) continue;
+                struct stat st;
+                if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+                    if (n++) buf_putc(&b, ',');
+                    steering_profile_json(&b, de->d_name, path, want, false);
+                }
+                free(path);
+            }
+            closedir(d);
+        }
+    }
+    buf_puts(&b, "]}\n");
+    const bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/* POST /v1/steering: omitted keys keep their current value; "profile":""
+ * clears the default profile (scales then must be 0 to be meaningful). A
+ * named profile must resolve to a regular file of the expected size, so a
+ * typo fails here instead of on the next job. */
+static bool steering_handle_post(server *s, int fd, const char *body) {
+    char err[200];
+    err[0] = '\0';
+    if (!s->steering_supported) {
+        return http_error(fd, s->enable_cors, 400,
+                          "runtime steering is only available on the GPU backend");
+    }
+    float attn = 0.0f, ffn = 0.0f;
+    bool attn_set = false, ffn_set = false;
+    char *name = NULL;
+    const char *p = body ? body : "";
+    if (!json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, true)) {
+        free(name);
+        return http_error(fd, s->enable_cors, 400,
+                          "expected {\"profile\":NAME,\"attn\":F,\"ffn\":F} with finite scales "
+                          "in [-100,100] and a bare file name");
+    }
+    if (name && name[0]) {
+        char *path = steering_resolve_profile(s, name, err, sizeof(err));
+        if (!path) {
+            free(name);
+            return http_error(fd, s->enable_cors, 400, err);
+        }
+        struct stat st;
+        const bool have = stat(path, &st) == 0 && S_ISREG(st.st_mode);
+        const uint64_t want = steering_profile_bytes(s);
+        if (!have) {
+            snprintf(err, sizeof(err), "steering profile not found: %s", path);
+        } else if (want && (uint64_t)st.st_size != want) {
+            snprintf(err, sizeof(err), "steering profile %s has %llu bytes, expected %llu",
+                     path, (unsigned long long)st.st_size, (unsigned long long)want);
+        }
+        free(path);
+        if (!have || err[0] != '\0') {
+            free(name);
+            return http_error(fd, s->enable_cors, have ? 400 : 404, err);
+        }
+    }
+    pthread_mutex_lock(&s->steering_mu);
+    /* Commit the merged default only if it is something a job can apply:
+     * scales without a profile would otherwise fail every later request.
+     * "profile":"" means steering off, so it also drops the scales unless
+     * this same POST sets them. */
+    const bool clearing = name && !name[0];
+    const char *eff_name = name ? name : (s->steering_default_name ? s->steering_default_name : "");
+    const float eff_attn = attn_set ? attn : (clearing ? 0.0f : s->steering_default_attn);
+    const float eff_ffn = ffn_set ? ffn : (clearing ? 0.0f : s->steering_default_ffn);
+    if (!eff_name[0] && (eff_attn != 0.0f || eff_ffn != 0.0f)) {
+        pthread_mutex_unlock(&s->steering_mu);
+        free(name);
+        return http_error(fd, s->enable_cors, 400,
+                          "steering scales given but no profile: name a profile (or start the "
+                          "server with --dir-steering-file), or set attn and ffn to 0");
+    }
+    if (name) {
+        free(s->steering_default_name);
+        s->steering_default_name = name[0] ? name : NULL;
+        if (!name[0]) free(name);
+    }
+    s->steering_default_attn = eff_attn;
+    s->steering_default_ffn = eff_ffn;
+    pthread_mutex_unlock(&s->steering_mu);
+    return steering_send_state(s, fd);
+}
+
+static bool steering_handle_delete(server *s, int fd) {
+    pthread_mutex_lock(&s->steering_mu);
+    free(s->steering_default_name);
+    s->steering_default_name = s->steering_launch_name ? xstrdup(s->steering_launch_name) : NULL;
+    s->steering_default_attn = s->steering_launch_attn;
+    s->steering_default_ffn = s->steering_launch_ffn;
+    pthread_mutex_unlock(&s->steering_mu);
+    return steering_send_state(s, fd);
+}
+
+/* Route the steering admin endpoints; true when `hr` was one of them. Other
+ * methods on these paths fall through to the usual 404 like every other
+ * unknown method+path pair in this server. */
+static bool steering_handle_request(server *s, int fd, const http_request *hr) {
+    if (!strcmp(hr->path, "/v1/steering")) {
+        if (!strcmp(hr->method, "GET")) {
+            steering_send_state(s, fd);
+            return true;
+        }
+        if (!strcmp(hr->method, "POST")) {
+            steering_handle_post(s, fd, hr->body);
+            return true;
+        }
+        if (!strcmp(hr->method, "DELETE")) {
+            steering_handle_delete(s, fd);
+            return true;
+        }
+        return false;
+    }
+    if (!strcmp(hr->path, "/v1/steering/profiles") && !strcmp(hr->method, "GET")) {
+        steering_send_profiles(s, fd);
+        return true;
+    }
+    return false;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -12820,6 +13324,10 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (steering_handle_request(s, fd, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -12949,6 +13457,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    const char *steering_dir;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -13026,10 +13535,15 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        free(slot->steering_name);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
     free(s->slots);
+    free(s->steering_launch_name);
+    free(s->steering_launch_path);
+    free(s->steering_default_name);
+    pthread_mutex_destroy(&s->steering_mu);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->kv_mu);
     pthread_mutex_destroy(&s->inference_mu);
@@ -13239,6 +13753,8 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--steering-dir")) {
+            c.steering_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
@@ -13383,6 +13899,23 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    /* Runtime steering: the launch --dir-steering-* configuration becomes the
+     * initial server default; the launch file is addressable by its basename
+     * (truncated like the engine's cache key). */
+    s.steering_dir = cfg.steering_dir;
+    s.steering_launch_attn = cfg.engine.directional_steering_attn;
+    s.steering_launch_ffn = cfg.engine.directional_steering_ffn;
+    if (cfg.engine.directional_steering_file && cfg.engine.directional_steering_file[0]) {
+        const char *base = strrchr(cfg.engine.directional_steering_file, '/');
+        base = base ? base + 1 : cfg.engine.directional_steering_file;
+        char nm[STEERING_NAME_MAX + 1];
+        snprintf(nm, sizeof(nm), "%s", base);
+        s.steering_launch_name = xstrdup(nm);
+        s.steering_launch_path = xstrdup(cfg.engine.directional_steering_file);
+        s.steering_default_name = xstrdup(nm);
+    }
+    s.steering_default_attn = s.steering_launch_attn;
+    s.steering_default_ffn = s.steering_launch_ffn;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -13403,6 +13936,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.steering_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -13415,6 +13949,28 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        /* Initial per-slot steering report: whatever session create loaded
+         * from the launch configuration. */
+        ds4_session_get_steering(slot->session, &slot->steering_attn,
+                                 &slot->steering_ffn, &slot->steering_loaded);
+        if (slot->steering_loaded && s.steering_launch_name) {
+            slot->steering_name = xstrdup(s.steering_launch_name);
+        }
+    }
+    /* Runtime steering needs a GPU (non-GLM) session. Probe once with a
+     * no-op rewrite of slot 0's current scales so unsupported backends answer
+     * explicit steering requests with a clear 400 instead of silently
+     * ignoring the field. */
+    if (slot_count > 0) {
+        float a = 0.0f, f = 0.0f;
+        bool loaded = false;
+        ds4_session_get_steering(s.slots[0].session, &a, &f, &loaded);
+        s.steering_supported = ds4_session_set_steering_scale(s.slots[0].session, a, f) == 0;
+    }
+    if (s.steering_dir && !s.steering_supported) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --steering-dir ignored: runtime steering is unavailable for "
+                   "this backend/session type (needs a GPU, non-GLM, non-distributed session)");
     }
 
     if (cfg.kv_disk_dir) {
@@ -18308,6 +18864,399 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+/* ---- Runtime directional steering ------------------------------------- */
+
+static void test_steering_obj_parser(void) {
+    float attn = 0.0f, ffn = 0.0f;
+    bool attn_set = false, ffn_set = false;
+    char *name = NULL;
+    const char *p =
+        "{\"profile\":\"verbosity.f32\",\"attn\":0.5,\"ffn\":-1.25,"
+        "\"future\":[1,{\"x\":2}]}";
+    TEST_ASSERT(json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, false));
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(attn_set && attn == 0.5f);
+    TEST_ASSERT(ffn_set && ffn == -1.25f);
+    TEST_ASSERT(name && !strcmp(name, "verbosity.f32"));
+    free(name);
+    name = NULL;
+
+    /* Partial object: only the present axis is marked set; "name" aliases
+     * "profile". */
+    attn_set = ffn_set = false;
+    p = "{\"name\":\"terse\",\"ffn\":2}";
+    TEST_ASSERT(json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, false));
+    TEST_ASSERT(!attn_set && ffn_set && ffn == 2.0f);
+    TEST_ASSERT(name && !strcmp(name, "terse"));
+    free(name);
+    name = NULL;
+
+    /* Empty object is valid and sets nothing (inherit the server default). */
+    attn_set = ffn_set = false;
+    p = "{}";
+    TEST_ASSERT(json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, false));
+    TEST_ASSERT(!attn_set && !ffn_set && name == NULL);
+
+    /* Rejections: non-object, malformed, non-finite / out-of-range scales
+     * (json_number is strtod and accepts NaN/Infinity), unsafe or empty
+     * names. */
+    const char *bad[] = {
+        "[1]",
+        "{\"ffn\":1",
+        "{\"ffn\":\"1\"}",
+        "{\"ffn\":NaN}",
+        "{\"attn\":Infinity}",
+        "{\"ffn\":101}",
+        "{\"attn\":-100.5}",
+        "{\"profile\":\"../etc/passwd\"}",
+        "{\"profile\":\"dir/file.f32\"}",
+        "{\"profile\":\"dir\\\\file.f32\"}",
+        "{\"profile\":\".hidden\"}",
+        "{\"profile\":\"\"}",
+        "{\"profile\":null}",
+        "{\"profile\":\"bad\\u0001name\"}",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        attn_set = ffn_set = false;
+        p = bad[i];
+        TEST_ASSERT(!json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, false));
+        free(name);
+        name = NULL;
+    }
+
+    /* The admin endpoint may clear the default profile with "". */
+    p = "{\"profile\":\"\"}";
+    TEST_ASSERT(json_parse_steering_obj(&p, &attn, &attn_set, &ffn, &ffn_set, &name, true));
+    TEST_ASSERT(name && name[0] == '\0');
+    free(name);
+    name = NULL;
+
+    /* Name length cap matches the engine's per-session cache key. */
+    char longname[STEERING_NAME_MAX + 2];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    TEST_ASSERT(!steering_name_valid(longname));
+    longname[STEERING_NAME_MAX] = '\0';
+    TEST_ASSERT(steering_name_valid(longname));
+}
+
+static void test_request_parsers_accept_steering_field(void) {
+    char err[160];
+    request r;
+    const char *steer = "\"steering\":{\"profile\":\"verbosity.f32\",\"ffn\":-1}";
+    char body[512];
+
+    snprintf(body, sizeof(body),
+             "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,%s,"
+             "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}", steer);
+    TEST_ASSERT(parse_chat_request(NULL, NULL, body, 1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(r.steering_name && !strcmp(r.steering_name, "verbosity.f32"));
+    TEST_ASSERT(r.steering_ffn_set && r.steering_ffn == -1.0f && !r.steering_attn_set);
+    request_free(&r);
+    TEST_ASSERT(r.steering_name == NULL);
+
+    TEST_ASSERT(parse_anthropic_request(NULL, NULL, body, 1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(r.steering_name && r.steering_ffn_set && r.steering_ffn == -1.0f);
+    request_free(&r);
+
+    snprintf(body, sizeof(body),
+             "{\"model\":\"deepseek-v4-flash\",\"max_output_tokens\":1,%s,"
+             "\"input\":\"hello\"}", steer);
+    TEST_ASSERT(parse_responses_request(NULL, NULL, body, 1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(r.steering_name && r.steering_ffn_set);
+    request_free(&r);
+
+    snprintf(body, sizeof(body),
+             "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,%s,"
+             "\"prompt\":\"hello\"}", steer);
+    TEST_ASSERT(parse_completion_request(NULL, body, 1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(r.steering_name && r.steering_ffn_set);
+    request_free(&r);
+
+    /* No steering key: nothing set, so the job inherits the server default. */
+    TEST_ASSERT(parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!r.steering_name && !r.steering_attn_set && !r.steering_ffn_set);
+    request_free(&r);
+
+    /* A bad steering object fails the whole request in every parser. */
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"steering\":{\"profile\":\"../x\"},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"steering\":{\"ffn\":NaN},"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_output_tokens\":1,"
+        "\"steering\":[1],\"input\":\"hello\"}",
+        1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_completion_request(NULL,
+        "{\"model\":\"deepseek-v4-flash\",\"max_tokens\":1,"
+        "\"steering\":{\"ffn\":1000},\"prompt\":\"hello\"}",
+        1, 100, &r, err, sizeof(err)));
+}
+
+/* Drive one steering admin request through a socketpair and return the raw
+ * HTTP response text (NULL if the socketpair could not be created). */
+static char *test_steering_roundtrip(server *s, const char *method, const char *path,
+                                     const char *body, bool *handled) {
+    int sv[2];
+    *handled = false;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "%s", method);
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    hr.body = xstrdup(body ? body : "");
+    hr.body_len = strlen(hr.body);
+    *handled = steering_handle_request(s, sv[0], &hr);
+    free(hr.body);
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+static void test_steering_endpoints_without_engine(void) {
+    server s = {0};
+    pthread_mutex_init(&s.steering_mu, NULL);
+    s.steering_supported = true;
+    s.steering_launch_name = xstrdup("verbosity.f32");
+    s.steering_launch_path = xstrdup("/nonexistent/verbosity.f32");
+    s.steering_launch_ffn = 1.0f;
+    s.steering_default_name = xstrdup("verbosity.f32");
+    s.steering_default_ffn = 1.0f;
+
+    /* Profile resolution: the launch name maps to the launch path from
+     * anywhere; other names need --steering-dir and stay inside it. */
+    char err[160] = {0};
+    char *path = steering_resolve_profile(&s, "verbosity.f32", err, sizeof(err));
+    TEST_ASSERT(path && !strcmp(path, "/nonexistent/verbosity.f32"));
+    free(path);
+    TEST_ASSERT(steering_resolve_profile(&s, "other.f32", err, sizeof(err)) == NULL);
+    TEST_ASSERT(strstr(err, "--steering-dir") != NULL);
+    char dir[] = "/tmp/ds4-steering-test-XXXXXX";
+    const bool have_dir = mkdtemp(dir) != NULL;
+    TEST_ASSERT(have_dir);
+    s.steering_dir = have_dir ? dir : "/tmp/ds4-steering-test-missing";
+    path = steering_resolve_profile(&s, "other.f32", err, sizeof(err));
+    TEST_ASSERT(path && strstr(path, "/other.f32") != NULL &&
+                !strncmp(path, s.steering_dir, strlen(s.steering_dir)));
+    free(path);
+    TEST_ASSERT(steering_resolve_profile(&s, "../other.f32", err, sizeof(err)) == NULL);
+    TEST_ASSERT(steering_resolve_profile(&s, "a/b", err, sizeof(err)) == NULL);
+    TEST_ASSERT(steering_resolve_profile(&s, "", err, sizeof(err)) == NULL);
+
+    bool handled = false;
+    char *out;
+
+    /* GET reports the default and no slots. */
+    out = test_steering_roundtrip(&s, "GET", "/v1/steering", NULL, &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(out && strstr(out, "\"supported\":true") != NULL);
+    TEST_ASSERT(out && strstr(out, "\"launch_profile\":\"verbosity.f32\"") != NULL);
+    TEST_ASSERT(out && strstr(out,
+        "\"default\":{\"profile\":\"verbosity.f32\",\"attn\":0,\"ffn\":1},\"slots\":[]") != NULL);
+    free(out);
+
+    /* POST with only a scale changes that scale and keeps the profile. */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"ffn\":-1.5}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(out && strstr(out,
+        "\"default\":{\"profile\":\"verbosity.f32\",\"attn\":0,\"ffn\":-1.5}") != NULL);
+    TEST_ASSERT(s.steering_default_ffn == -1.5f);
+    TEST_ASSERT(s.steering_default_name && !strcmp(s.steering_default_name, "verbosity.f32"));
+    free(out);
+
+    /* A missing profile file is a 404 and leaves the default untouched. */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering",
+                                  "{\"profile\":\"missing.f32\",\"ffn\":2}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 404") != NULL);
+    TEST_ASSERT(s.steering_default_ffn == -1.5f);
+    TEST_ASSERT(s.steering_default_name && !strcmp(s.steering_default_name, "verbosity.f32"));
+    free(out);
+
+    /* Bad scale / bad JSON / bad name are 400s. */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"ffn\":1e9}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    free(out);
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"ffn\":", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    free(out);
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"profile\":\"../x\"}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    free(out);
+
+    /* A real file under --steering-dir becomes the default (no engine, so no
+     * size check) and shows up in the profile listing as valid. */
+    if (have_dir) {
+        char fpath[sizeof(dir) + 16];
+        snprintf(fpath, sizeof(fpath), "%s/%s", dir, "terse.f32");
+        FILE *fp = fopen(fpath, "wb");
+        TEST_ASSERT(fp != NULL);
+        if (fp) {
+            const float v[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+            fwrite(v, sizeof(v), 1, fp);
+            fclose(fp);
+        }
+        out = test_steering_roundtrip(&s, "POST", "/v1/steering",
+                                      "{\"profile\":\"terse.f32\",\"ffn\":2}", &handled);
+        TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(out && strstr(out,
+            "\"default\":{\"profile\":\"terse.f32\",\"attn\":0,\"ffn\":2}") != NULL);
+        free(out);
+
+        out = test_steering_roundtrip(&s, "GET", "/v1/steering/profiles", NULL, &handled);
+        TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(out && strstr(out, "\"name\":\"terse.f32\",\"bytes\":16,\"valid\":true,\"launch\":false") != NULL);
+        TEST_ASSERT(out && strstr(out, "\"name\":\"verbosity.f32\",\"bytes\":null,\"valid\":false,\"launch\":true") != NULL);
+        free(out);
+        unlink(fpath);
+    }
+
+    /* "" clears the default profile AND its scales (steering off); DELETE
+     * restores the launch config. */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"profile\":\"\"}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(out && strstr(out, "\"default\":{\"profile\":null,\"attn\":0,\"ffn\":0}") != NULL);
+    TEST_ASSERT(s.steering_default_name == NULL);
+    TEST_ASSERT(s.steering_default_ffn == 0.0f);
+    free(out);
+    /* Scales without any profile can never be applied: refused, default kept. */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"ffn\":1}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    TEST_ASSERT(s.steering_default_name == NULL && s.steering_default_ffn == 0.0f);
+    free(out);
+    out = test_steering_roundtrip(&s, "DELETE", "/v1/steering", NULL, &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(out && strstr(out,
+        "\"default\":{\"profile\":\"verbosity.f32\",\"attn\":0,\"ffn\":1}") != NULL);
+    TEST_ASSERT(s.steering_default_name && !strcmp(s.steering_default_name, "verbosity.f32"));
+    free(out);
+    /* Clearing the profile while explicitly keeping a nonzero scale is
+     * refused too (it would leave an unapplicable default). */
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering",
+                                  "{\"profile\":\"\",\"ffn\":1}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    TEST_ASSERT(s.steering_default_name && !strcmp(s.steering_default_name, "verbosity.f32"));
+    free(out);
+
+    /* Other methods and other paths are not ours (they fall through to the
+     * server's usual 404). */
+    out = test_steering_roundtrip(&s, "PUT", "/v1/steering", "{}", &handled);
+    TEST_ASSERT(!handled);
+    free(out);
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering/profiles", "{}", &handled);
+    TEST_ASSERT(!handled);
+    free(out);
+    out = test_steering_roundtrip(&s, "GET", "/v1/models", NULL, &handled);
+    TEST_ASSERT(!handled);
+    free(out);
+
+    /* Unsupported backend: POST is refused, GET still answers. */
+    s.steering_supported = false;
+    out = test_steering_roundtrip(&s, "POST", "/v1/steering", "{\"ffn\":1}", &handled);
+    TEST_ASSERT(handled && out && strstr(out, "HTTP/1.1 400") != NULL);
+    free(out);
+    out = test_steering_roundtrip(&s, "GET", "/v1/steering", NULL, &handled);
+    TEST_ASSERT(handled && out && strstr(out, "\"supported\":false") != NULL);
+    free(out);
+
+    if (have_dir) rmdir(dir);
+    free(s.steering_launch_name);
+    free(s.steering_launch_path);
+    free(s.steering_default_name);
+    pthread_mutex_destroy(&s.steering_mu);
+}
+
+/* The per-job application path on an unsupported backend (no engine here):
+ * defaults-only requests pass through untouched, explicit steering is a 400
+ * and a steering-free request body parses into the "inherit" state. */
+static void test_steering_apply_job_unsupported_backend(void) {
+    server s = {0};
+    server_slot slot = {0};
+    pthread_mutex_init(&s.steering_mu, NULL);
+    pthread_mutex_init(&s.inference_mu, NULL);
+    job j;
+    memset(&j, 0, sizeof(j));
+    request_init(&j.req, REQ_CHAT, 16);
+    char err[160] = {0};
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 0);
+    j.req.steering_ffn = -1.0f;
+    j.req.steering_ffn_set = true;
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 400);
+    TEST_ASSERT(strstr(err, "GPU backend") != NULL);
+    request_free(&j.req);
+    pthread_mutex_destroy(&s.inference_mu);
+    pthread_mutex_destroy(&s.steering_mu);
+}
+
+/* The per-job application path on a supported backend, without a model:
+ * slot->session == NULL makes the engine setter fail ("no session"), which
+ * is enough to exercise default resolution, the explicit-400 vs default-500
+ * split and the no-profile rules without touching the GPU. */
+static void test_steering_apply_job_resolution(void) {
+    server s = {0};
+    server_slot slot = {0};
+    pthread_mutex_init(&s.steering_mu, NULL);
+    pthread_mutex_init(&s.inference_mu, NULL);
+    s.steering_supported = true;
+    s.steering_launch_name = xstrdup("verbosity.f32");
+    s.steering_launch_path = xstrdup("/nonexistent/verbosity.f32");
+    s.steering_default_name = xstrdup("verbosity.f32");
+    s.steering_default_ffn = 1.0f;
+    job j;
+    memset(&j, 0, sizeof(j));
+    request_init(&j.req, REQ_CHAT, 16);
+    char err[160] = {0};
+
+    /* Default profile resolves (to the launch path) and reaches the engine,
+     * whose failure on a NULL session is a server-side 500. */
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 500);
+    TEST_ASSERT(strstr(err, "no session") != NULL);
+    TEST_ASSERT(slot.steering_name == NULL);
+
+    /* The same failure on an explicit request is the client's 400. */
+    j.req.steering_name = xstrdup("verbosity.f32");
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 400);
+    free(j.req.steering_name);
+    j.req.steering_name = NULL;
+
+    /* Unknown profile name without --steering-dir: resolved server-side. */
+    j.req.steering_name = xstrdup("other.f32");
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 400);
+    TEST_ASSERT(strstr(err, "--steering-dir") != NULL);
+    free(j.req.steering_name);
+    j.req.steering_name = NULL;
+
+    /* No profile anywhere: an inherited nonzero scale means "steering off"
+     * (the engine is still asked, hence 500 here with no session), while an
+     * explicitly requested scale is refused with a 400 before the engine. */
+    free(s.steering_default_name);
+    s.steering_default_name = NULL;
+    s.steering_default_ffn = 1.0f;
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 500);
+    TEST_ASSERT(strstr(err, "no session") != NULL);
+    j.req.steering_ffn = -1.0f;
+    j.req.steering_ffn_set = true;
+    TEST_ASSERT(steering_apply_job(&s, &slot, &j, err, sizeof(err)) == 400);
+    TEST_ASSERT(strstr(err, "no profile") != NULL);
+
+    request_free(&j.req);
+    free(slot.steering_name);
+    free(s.steering_launch_name);
+    free(s.steering_launch_path);
+    free(s.steering_default_name);
+    pthread_mutex_destroy(&s.inference_mu);
+    pthread_mutex_destroy(&s.steering_mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -18433,6 +19382,11 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_steering_obj_parser();
+    test_request_parsers_accept_steering_field();
+    test_steering_endpoints_without_engine();
+    test_steering_apply_job_unsupported_backend();
+    test_steering_apply_job_resolution();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

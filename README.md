@@ -1041,10 +1041,18 @@ Supported endpoints:
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
+- `GET /v1/steering`, `POST /v1/steering`, `DELETE /v1/steering`
+- `GET /v1/steering/profiles`
 
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
 not select a different model.
+
+All four generation endpoints also accept an optional `steering` object
+(`profile`, `attn`, `ffn`) that overrides the server's directional-steering
+default for that one request; the `/v1/steering` endpoints read, change and
+reset that default. A malformed `steering` object fails the request with 400.
+See `dir-steering/README.md`, "Runtime Steering (ds4-server)".
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,

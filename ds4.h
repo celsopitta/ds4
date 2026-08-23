@@ -332,6 +332,32 @@ void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
+
+/* Runtime directional steering, per session (GPU backends only; GLM is not
+ * supported, same as --dir-steering-*). The direction profile and the two
+ * scales are read fresh by every forward pass, so a change is live on the
+ * next eval. A profile is a flat n_layer*n_embd f32 direction file (see
+ * dir-steering/README.md), cached per session under `name` on first use:
+ * re-selecting a cached name is a pointer swap, no disk or GPU traffic.
+ *
+ * Callers must not race an eval of the same session (ds4-server applies
+ * steering from the slot worker between jobs).
+ *
+ *  - steering_select: activate profile `name` (loaded from `path` on a cache
+ *    miss; `path` may be NULL for an already-cached name) with the given
+ *    scales. name == NULL / "" turns steering off (scales still recorded).
+ *    Returns 0 on success, nonzero with `err` filled on failure, in which
+ *    case the previous steering state is left untouched.
+ *  - set_steering_scale: keep the active profile, change only the strengths
+ *    (0/0 = bit-identical to no steering). Returns nonzero if unsupported.
+ *  - get_steering: current scales and whether any direction tensor is loaded.
+ *  - steering_is_cached: true if `name` is resident in this session's cache. */
+int ds4_session_steering_select(ds4_session *s, const char *name, const char *path,
+                                float attn_scale, float ffn_scale,
+                                char *err, size_t errlen);
+int ds4_session_set_steering_scale(ds4_session *s, float attn_scale, float ffn_scale);
+void ds4_session_get_steering(ds4_session *s, float *attn_scale, float *ffn_scale, bool *loaded);
+bool ds4_session_steering_is_cached(ds4_session *s, const char *name);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */

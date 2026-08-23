@@ -18702,7 +18702,10 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 
     uint32_t nth = 256u;
     while (nth > width && nth > 1u) nth >>= 1;
-    directional_steering_project_kernel<<<rows, nth>>>(
+    /* Launch on the decode stream so the projection is capturable inside a
+     * decode-island graph (a legacy-stream launch under global capture
+     * aborts the island); outside capture this is the NULL stream anyway. */
+    directional_steering_project_kernel<<<rows, nth, 0, cuda_decode_stream()>>>(
             (float *)x->ptr,
             (const float *)directions->ptr,
             layer,

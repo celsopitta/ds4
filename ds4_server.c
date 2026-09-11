@@ -6288,6 +6288,35 @@ static void glm_collect_marked_reasoning(char **content_out, char **reasoning_ou
     strip_ctl_tags_in_place(reasoning_out);
 }
 
+/* GLM's template opens reasoning for the model.  When the model never closes
+ * it and ends the turn with its own stop token, it skipped thinking and the
+ * text is the answer: SGLang measured every such case on a production
+ * GLM-5.2 deployment to be the final answer (PR #37644).  Length, client
+ * stop strings and tool calls keep truncated reasoning as reasoning, and a
+ * block opened by a client prefill is left alone. */
+static bool glm_skipped_thinking_is_answer(const request *r, const char *text,
+                                           const char *finish, bool client_stop,
+                                           const tool_calls *calls,
+                                           char **content, char **reasoning) {
+    if (!ctl->marked || !r || r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return false;
+    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (!finish || strcmp(finish, "stop") != 0 || client_stop) return false;
+    if (calls && calls->len) return false;
+    if (!text || strstr(text, ctl->think_close) || strstr(text, ctl->tool_call_open)) return false;
+    const char *prompt = r->prompt_text ? r->prompt_text : "";
+    const size_t prompt_len = strlen(prompt);
+    const size_t a = strlen(ctl->assistant), t = strlen(ctl->think_open);
+    if (prompt_len < a + t ||
+        memcmp(prompt + prompt_len - t, ctl->think_open, t) != 0 ||
+        memcmp(prompt + prompt_len - t - a, ctl->assistant, a) != 0) return false;
+    if (!*reasoning || !(*reasoning)[0]) return false;
+    if (*content && (*content)[0]) return false;
+    free(*content);
+    *content = *reasoning;
+    *reasoning = NULL;
+    return true;
+}
+
 static bool parse_glm_generated_message_ex(const char *text,
                                            bool require_thinking_closed,
                                            char **content_out,
@@ -6805,6 +6834,9 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
+    /* Answer that streamed as reasoning (a GLM turn that skipped thinking);
+     * the finish sends it again as the answer.  Not owned. */
+    const char *late_answer;
     openai_tool_stream tool;
 } openai_stream;
 
@@ -7771,6 +7803,11 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+    if (st->late_answer && st->late_answer[0]) {
+        if (!sse_chat_delta_n(fd, r, id, "content", st->late_answer,
+                              strlen(st->late_answer))) return false;
+        st->sent_content = true;
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -7858,6 +7895,9 @@ typedef struct {
     int message_index;     /* output_index of the assistant message item */
     int next_output_index; /* monotonic counter for upcoming output items */
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    /* Answer that streamed as reasoning (a GLM turn that skipped thinking);
+     * the finish sends it again as the answer.  Not owned. */
+    const char *late_answer;
 } responses_stream;
 
 static void responses_stream_init(const request *r, responses_stream *st) {
@@ -8528,9 +8568,16 @@ static bool responses_sse_finish_live(int fd, const request *r,
      * response. We use the stream cursor instead of comparing against
      * recovered_content because the raw text can begin with `<think>...</think>`
      * which the streaming side consumed as reasoning, not message text. */
+    const char *tail = NULL;
+    size_t tail_len = 0;
     if (recovered_content && raw && st->emit_pos < raw_len) {
-        const char *tail = raw + st->emit_pos;
-        size_t tail_len = raw_len - st->emit_pos;
+        tail = raw + st->emit_pos;
+        tail_len = raw_len - st->emit_pos;
+    } else if (st->late_answer && st->late_answer[0]) {
+        tail = st->late_answer;
+        tail_len = strlen(st->late_answer);
+    }
+    if (tail) {
         if (!st->message_item_opened) {
             st->message_index = st->next_output_index++;
             if (!responses_sse_message_added(fd, st)) return false;
@@ -8543,7 +8590,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
         buf_append_visible(&st->message_text, tail, tail_len);
         st->message_emitted_any = true;
-        st->emit_pos = raw_len;
+        if (tail != st->late_answer) st->emit_pos = raw_len;
     }
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
@@ -8830,6 +8877,9 @@ typedef struct {
     bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
+    /* Answer that streamed as reasoning (a GLM turn that skipped thinking);
+     * the finish sends it again as the answer.  Not owned. */
+    const char *late_answer;
     anthropic_tool_stream tool;
 } anthropic_stream;
 
@@ -9505,6 +9555,14 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+    if (st->late_answer && st->late_answer[0]) {
+        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+        if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+        if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT, st->late_answer,
+                                      strlen(st->late_answer))) return false;
+        st->sent_text = true;
+        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+    }
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -13893,6 +13951,21 @@ decode_again:
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure, &j->req.tool_orders);
+        if (parsed_ok &&
+            glm_skipped_thinking_is_answer(&j->req, text.ptr, finish, client_stop,
+                                           &parsed_calls, &parsed_content,
+                                           &parsed_reasoning)) {
+            openai_live.late_answer = parsed_content;
+            anthropic_live.late_answer = parsed_content;
+            responses_live.late_answer = parsed_content;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s reasoning never closed before the model's stop token; returned as the answer (%zu bytes)",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       strlen(parsed_content));
+            trace_event(s, trace_id, "unclosed reasoning ended on a stop token; returned as answer");
+        }
         if (ctl->marked && j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM &&
             text.ptr && strstr(text.ptr, ctl->think_open)) {
             server_log(DS4_LOG_WARNING,
@@ -21178,6 +21251,50 @@ static void test_marked_glm_raw_tool_text_follows_spelling(void) {
     server_ctl_set_marked(true);
 }
 
+static void test_marked_glm_skipped_thinking_is_answer(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(DS4_CTL "[gMASK]" DS4_CTL "<sop>" DS4_CTL "<|user|>" "hi"
+                            DS4_CTL "<|assistant|>" DS4_CTL "<think>");
+    const char *generated = "{\"answer\": 4}";
+    const char *finishes[] = {"stop", "length", "stop"};
+    const bool client_stops[] = {false, false, true};
+    for (int i = 0; i < 3; i++) {
+        char *content = NULL, *reasoning = NULL;
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_GLM, generated, true, &content, &reasoning, &calls, NULL));
+        TEST_ASSERT(reasoning && !strcmp(reasoning, generated));
+        const bool moved = glm_skipped_thinking_is_answer(
+            &r, generated, finishes[i], client_stops[i], &calls, &content, &reasoning);
+        TEST_ASSERT(moved == (i == 0));
+        if (moved) {
+            TEST_ASSERT(content && !strcmp(content, generated));
+            TEST_ASSERT(reasoning == NULL);
+        } else {
+            TEST_ASSERT(reasoning && !strcmp(reasoning, generated));
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+    }
+
+    /* A closed block is ordinary reasoning plus answer. */
+    const char *closed = "why" DS4_CTL "</think>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, closed, true, &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(!glm_skipped_thinking_is_answer(&r, closed, "stop", false,
+                                                &calls, &content, &reasoning));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 static void test_marked_glm_openai_stream_does_not_hold_answer(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -21292,6 +21409,39 @@ static void test_marked_glm_anthropic_stream_second_block(void) {
     close(sv[1]);
 }
 
+static void test_marked_glm_stream_late_answer(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw = "the whole answer";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_late",
+                                         &st, raw, strlen(raw), false));
+    st.late_answer = raw;
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_late",
+                                       &st, raw, strlen(raw), NULL, "stop", 5, 3));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"the whole answer\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"the whole answer\"") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_marked_glm_trackers_ignore_tag_text(void) {
     thinking_state th = {0};
     th.inside = true;
@@ -21339,9 +21489,11 @@ static void test_marked_glm_chat_text(void) {
     test_marked_glm_parse_tool_calls();
     test_marked_glm_parse_later_reasoning_before_tool_call();
     test_marked_glm_raw_tool_text_follows_spelling();
+    test_marked_glm_skipped_thinking_is_answer();
     test_marked_glm_openai_stream_does_not_hold_answer();
     test_marked_glm_openai_stream_second_block();
     test_marked_glm_anthropic_stream_second_block();
+    test_marked_glm_stream_late_answer();
     test_marked_glm_trackers_ignore_tag_text();
     test_marked_json_escape_drops_markers();
     test_marked_visible_text_drops_real_tags();

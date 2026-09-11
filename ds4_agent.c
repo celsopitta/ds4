@@ -4719,7 +4719,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     const int model_id = ds4_engine_model_id(w->engine);
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);
+    char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, false, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render KV text key");
         return false;
@@ -5048,7 +5048,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     agent_worker_build_system_tokens(w, &sys);
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &sys, &text_len);
+    char *text = ds4_kvstore_render_tokens_text(w->engine, &sys, false, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render system prompt");
         ds4_tokens_free(&sys);
@@ -5216,7 +5216,7 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
 
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
-                                                &text_len);
+                                                false, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
         return false;
@@ -5827,7 +5827,7 @@ static bool agent_worker_show_history(agent_worker *w, int user_turns,
     }
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
-                                                &text_len);
+                                                false, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
         return false;

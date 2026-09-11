@@ -62,6 +62,8 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* Key checkpoints by marked chat text (see DS4_CTL in ds4.h). */
+    bool marked_text;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -121,6 +123,7 @@ void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
+                                     bool marked,
                                      size_t *out_len);
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
@@ -129,6 +132,7 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
+        bool marked,
         ds4_tokens *out);
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);

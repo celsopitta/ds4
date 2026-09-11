@@ -278,6 +278,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
     opt(fp, c, "--dump-tokens", "Print the exact CLI prompt token stream, then exit. Use --raw for literal text.");
+    opt(fp, c, "--marked", "With --dump-tokens: read the prompt as marked chat text (0xFF before each control tag) and check the round trip.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");

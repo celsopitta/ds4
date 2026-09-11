@@ -340,6 +340,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+int ds4_dump_marked_chat_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,
@@ -359,6 +360,15 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+
+/* Marked chat text writes every real chat control token as DS4_CTL followed
+ * by its tag, so a tag spelled inside message content stays ordinary text.
+ * 0xFF never occurs in valid UTF-8; llguidance marks special tokens the same
+ * way (TokTrie::SPECIAL_TOKEN_MARKER). */
+#define DS4_CTL_BYTE 0xFF
+#define DS4_CTL "\xFF"
+void ds4_tokenize_marked_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+char *ds4_token_text_marked(ds4_engine *e, int token, size_t *len);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 void ds4_encode_chat_prompt(
         ds4_engine *e,

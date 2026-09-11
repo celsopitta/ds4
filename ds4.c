@@ -39822,11 +39822,15 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
-static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
-        const char *text;
-        int token;
-    } specials[] = {
+typedef struct {
+    const char *text;
+    int token;
+} chat_special;
+
+enum { CHAT_SPECIAL_COUNT = 21 };
+
+static void chat_specials(const ds4_vocab *vocab, chat_special out[CHAT_SPECIAL_COUNT]) {
+    const chat_special specials[CHAT_SPECIAL_COUNT] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
@@ -39849,8 +39853,13 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"</arg_value>",           vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
     };
+    memcpy(out, specials, sizeof(specials));
+}
 
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    chat_special specials[CHAT_SPECIAL_COUNT];
+    chat_specials(vocab, specials);
+    for (size_t i = 0; i < CHAT_SPECIAL_COUNT; i++) {
         if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
@@ -39858,6 +39867,18 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
             *len = n;
             return true;
         }
+    }
+    return false;
+}
+
+/* True for exactly the ids special_token_at() can produce, so marked token
+ * text always tokenizes back to the same id. */
+static bool vocab_token_is_chat_special(const ds4_vocab *vocab, int token) {
+    if (token < 0) return false;
+    chat_special specials[CHAT_SPECIAL_COUNT];
+    chat_specials(vocab, specials);
+    for (size_t i = 0; i < CHAT_SPECIAL_COUNT; i++) {
+        if (specials[i].token == token) return true;
     }
     return false;
 }
@@ -39874,8 +39895,11 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
 
 
 
-static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
-                                         token_vec *out) {
+/* Unmarked text treats every tag spelling as a control token.  Marked text
+ * only accepts a tag right after DS4_CTL; everything else, tag-shaped or not,
+ * is BPE text.  A marker that does not introduce a known tag is dropped. */
+static void tokenize_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                bool marked, token_vec *out) {
     if (!text) text = "";
 
     const char *span = text;
@@ -39883,6 +39907,20 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
     while (*p) {
         int token = -1;
         size_t len = 0;
+        if (marked) {
+            if ((unsigned char)*p != DS4_CTL_BYTE) {
+                p++;
+                continue;
+            }
+            tokenize_span(vocab, span, (size_t)(p - span), out);
+            p++;
+            if (special_token_at(vocab, p, &token, &len)) {
+                token_vec_push(out, token);
+                p += len;
+            }
+            span = p;
+            continue;
+        }
         if (special_token_at(vocab, p, &token, &len)) {
             tokenize_span(vocab, span, (size_t)(p - span), out);
             token_vec_push(out, token);
@@ -39895,8 +39933,17 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
     tokenize_span(vocab, span, (size_t)(p - span), out);
 }
 
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
+    tokenize_chat_vocab(vocab, text, false, out);
+}
+
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
+}
+
+void ds4_tokenize_marked_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+    tokenize_chat_vocab(&e->vocab, text, true, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
@@ -40081,8 +40128,7 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     return false;
 }
 
-char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
+static char *vocab_token_text(const ds4_vocab *vocab, int token, size_t *len) {
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = xmalloc(1);
@@ -40109,6 +40155,48 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     out[n] = '\0';
     if (len) *len = n;
     return out;
+}
+
+char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
+    return vocab_token_text(&e->vocab, token, len);
+}
+
+/* Byte-level BPE can emit a lone 0xFF byte.  Spell it as U+FFFD so generated
+ * text can never forge a marker; the prompt renderer does the same to client
+ * content, which keeps both sides of a cache match identical. */
+static char *vocab_token_text_marked(const ds4_vocab *vocab, int token, size_t *len) {
+    size_t n = 0;
+    char *text = vocab_token_text(vocab, token, &n);
+    if (vocab_token_is_chat_special(vocab, token)) {
+        char *out = xmalloc(n + 2);
+        out[0] = (char)DS4_CTL_BYTE;
+        memcpy(out + 1, text, n + 1);
+        free(text);
+        if (len) *len = n + 1;
+        return out;
+    }
+    if (!memchr(text, DS4_CTL_BYTE, n)) {
+        if (len) *len = n;
+        return text;
+    }
+    char *out = xmalloc(n * 3 + 1);
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if ((unsigned char)text[i] == DS4_CTL_BYTE) {
+            memcpy(out + m, "\xEF\xBF\xBD", 3);
+            m += 3;
+        } else {
+            out[m++] = text[i];
+        }
+    }
+    out[m] = '\0';
+    free(text);
+    if (len) *len = m;
+    return out;
+}
+
+char *ds4_token_text_marked(ds4_engine *e, int token, size_t *len) {
+    return vocab_token_text_marked(&e->vocab, token, len);
 }
 
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
@@ -57709,6 +57797,44 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     vocab_free(&vocab);
     model_close(&model);
     return 0;
+}
+
+/* Debug aid for marked chat text: dump the tokens and check that rendering
+ * them back with ds4_token_text_marked() reproduces the input bytes. */
+int ds4_dump_marked_chat_tokenization(const char *model_path, const char *text, FILE *fp) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    if (!text) text = "";
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    vocab_load(&vocab, &model);
+    tokenize_chat_vocab(&vocab, text, true, &tokens);
+    dump_tokens_fp(fp, &vocab, &tokens);
+
+    size_t text_len = strlen(text);
+    size_t off = 0;
+    int bad = -1;
+    for (int i = 0; i < tokens.len && bad < 0; i++) {
+        size_t n = 0;
+        char *piece = vocab_token_text_marked(&vocab, tokens.v[i], &n);
+        if (n > text_len - off || memcmp(piece, text + off, n) != 0) bad = i;
+        else off += n;
+        free(piece);
+    }
+    if (bad < 0 && off == text_len) {
+        fprintf(fp, "marked round trip: exact (%zu bytes)\n", text_len);
+    } else {
+        fprintf(fp, "marked round trip: differs at byte %zu (token index %d)\n",
+                off, bad);
+    }
+    const bool exact = bad < 0 && off == text_len;
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return exact ? 0 : 1;
 }
 
 int ds4_dump_chat_tokenization(const char *model_path,

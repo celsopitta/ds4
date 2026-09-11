@@ -64,6 +64,7 @@ typedef struct {
     const char *system;
     ds4_prompt_prefix prefix;
     bool raw_prompt;
+    bool marked_prompt;
     int n_predict;
     int ctx_size;
     float temperature;
@@ -2017,6 +2018,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
+        } else if (!strcmp(arg, "--marked")) {
+            c.gen.marked_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
@@ -2275,7 +2278,11 @@ int main(int argc, char **argv) {
             return 2;
         }
         int rc;
-        if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
+        if (cfg.gen.marked_prompt) {
+            rc = ds4_dump_marked_chat_tokenization(cfg.engine.model_path,
+                                                   cfg.gen.prompt,
+                                                   stdout);
+        } else if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
             rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);

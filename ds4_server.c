@@ -10441,7 +10441,7 @@ static void kv_cache_close(kv_disk_cache *kc) {
 }
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
-    return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
+    return ds4_kvstore_render_tokens_text(engine, tokens, false, out_len);
 }
 
 static bool byte_prefix_match(const char *text, size_t text_len,
@@ -10462,7 +10462,7 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
         ds4_tokens *out)
 {
     ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, out);
+        engine, exact_prefix, suffix_text, false, out);
 }
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {

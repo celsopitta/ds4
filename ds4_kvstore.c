@@ -652,11 +652,14 @@ void ds4_kvstore_close(ds4_kvstore *kc) {
 
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
+                                     bool marked,
                                      size_t *out_len) {
     kv_buf b = {0};
     for (int i = 0; i < tokens->len; i++) {
         size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        char *piece = marked ?
+            ds4_token_text_marked(engine, tokens->v[i], &len) :
+            ds4_token_text(engine, tokens->v[i], &len);
         kv_buf_append(&b, piece, len);
         free(piece);
     }
@@ -686,13 +689,15 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
+        bool marked,
         ds4_tokens *out) {
     ds4_tokens_copy(out, exact_prefix);
 
     ds4_tokens suffix = {0};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
      * </think>, so use the rendered-chat tokenizer, not plain text BPE. */
-    ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    if (marked) ds4_tokenize_marked_chat(engine, suffix_text ? suffix_text : "", &suffix);
+    else ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
     tokens_append(out, &suffix);
     ds4_tokens_free(&suffix);
 }
@@ -969,7 +974,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         text = kv_xstrdup(cache_text_override);
         text_len = strlen(text);
     } else {
-        text = ds4_kvstore_render_tokens_text(engine, &store_tokens, &text_len);
+        text = ds4_kvstore_render_tokens_text(engine, &store_tokens,
+                                              kc->opt.marked_text, &text_len);
     }
     if (text_len > UINT32_MAX) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1286,7 +1292,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                  * suffix after the byte prefix. */
                 ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
                     engine, loaded_tokens, prompt_text + text_bytes,
-                    effective_prompt);
+                    kc->opt.marked_text, effective_prompt);
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
                 hooks->load(hooks->ud, fp, hooks->load_wanted);

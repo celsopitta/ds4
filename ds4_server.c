@@ -742,7 +742,7 @@ static void append_chat_content(buf *b, const char *s) {
 
 /* Length of the marked control tag at p: the whole tag, 1 for a marker that
  * does not start a known tag, 0 when p is not a marker. */
-static DS4_SERVER_MAYBE_UNUSED size_t ctl_marked_tag_len(const char *p, size_t n) {
+static size_t ctl_marked_tag_len(const char *p, size_t n) {
     if (!n || (unsigned char)*p != DS4_CTL_BYTE) return 0;
     const char *tags[] = {
         ctl_marked.think_open, ctl_marked.think_close,
@@ -760,6 +760,27 @@ static DS4_SERVER_MAYBE_UNUSED size_t ctl_marked_tag_len(const char *p, size_t n
     return 1;
 }
 
+/* Control tokens are never client-visible text.  The parsers consume the
+ * structural ones; any other real tag left inside reasoning or content (a
+ * nested <think>, a stray </think>) is dropped, as vLLM's GLM parser does. */
+static char *strip_ctl_tags_n(const char *s, size_t n) {
+    buf out = {0};
+    if (!s) return buf_take(&out);
+    if (!ctl->marked || !memchr(s, DS4_CTL_BYTE, n)) {
+        buf_append(&out, s, n);
+        return buf_take(&out);
+    }
+    for (size_t i = 0; i < n;) {
+        size_t tag = ctl_marked_tag_len(s + i, n - i);
+        if (tag) {
+            i += tag;
+        } else {
+            buf_putc(&out, s[i++]);
+        }
+    }
+    return buf_take(&out);
+}
+
 static const char *find_lit_bounded(const char *s, size_t n, const char *lit);
 
 /* Chat text <-> tokens in the server's spelling. */
@@ -771,6 +792,13 @@ static void server_tokenize_chat(ds4_engine *e, const char *text, ds4_tokens *ou
 static char *server_token_text(ds4_engine *e, int token, size_t *len) {
     return ctl->marked ? ds4_token_text_marked(e, token, len) :
                          ds4_token_text(e, token, len);
+}
+
+static void strip_ctl_tags_in_place(char **s) {
+    if (!s || !*s || !ctl->marked || !strchr(*s, DS4_CTL_BYTE)) return;
+    char *clean = strip_ctl_tags_n(*s, strlen(*s));
+    free(*s);
+    *s = clean;
 }
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
@@ -5405,6 +5433,19 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
     free(tmp);
 }
 
+/* Model text shown to a client: real control tags are dropped. */
+static void json_escape_visible_n(buf *b, const char *s, size_t n) {
+    char *v = strip_ctl_tags_n(s, n);
+    json_escape(b, v);
+    free(v);
+}
+
+static void buf_append_visible(buf *b, const char *s, size_t n) {
+    char *v = strip_ctl_tags_n(s, n);
+    buf_puts(b, v);
+    free(v);
+}
+
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -6054,12 +6095,12 @@ static void glm_tool_properties(const tool_schema_orders *orders,
     json_args_free(&schema);
 }
 
-static bool parse_glm_generated_message_ex(const char *text,
-                                           bool require_thinking_closed,
-                                           char **content_out,
-                                           char **reasoning_out,
-                                           tool_calls *calls,
-                                                  const tool_schema_orders *orders) {
+static bool parse_glm_generated_message_raw(const char *text,
+                                            bool require_thinking_closed,
+                                            char **content_out,
+                                            char **reasoning_out,
+                                            tool_calls *calls,
+                                            const tool_schema_orders *orders) {
     const char *tool_start = ctl->tool_call_open;
     const char *tool_end = ctl->tool_call_close;
     const char *arg_key_start = ctl->arg_key_open;
@@ -6204,6 +6245,59 @@ static bool parse_glm_generated_message_ex(const char *text,
     } else {
         split_reasoning_content(text, content_len, content_out, reasoning_out);
     }
+    return true;
+}
+
+/* Marked GLM output follows vLLM's GLM parser: reasoning ends at the first
+ * real </think>; a later real <think>...</think> in the answer is reasoning
+ * too (an unclosed one runs to the end); any other real tag is dropped, and
+ * tag-shaped text is left alone. */
+static void glm_collect_marked_reasoning(char **content_out, char **reasoning_out) {
+    if (!ctl->marked || !content_out || !*content_out) return;
+    if (strstr(*content_out, ctl->think_open)) {
+        buf answer = {0};
+        buf reasoning = {0};
+        if (*reasoning_out) buf_puts(&reasoning, *reasoning_out);
+        const char *p = *content_out;
+        for (;;) {
+            const char *open = strstr(p, ctl->think_open);
+            if (!open) {
+                buf_puts(&answer, p);
+                break;
+            }
+            buf_append(&answer, p, (size_t)(open - p));
+            p = open + strlen(ctl->think_open);
+            const char *close = strstr(p, ctl->think_close);
+            if (!close) {
+                buf_puts(&reasoning, p);
+                break;
+            }
+            buf_append(&reasoning, p, (size_t)(close - p));
+            p = close + strlen(ctl->think_close);
+        }
+        free(*content_out);
+        *content_out = buf_take(&answer);
+        if (reasoning.len || *reasoning_out) {
+            free(*reasoning_out);
+            *reasoning_out = buf_take(&reasoning);
+        } else {
+            buf_free(&reasoning);
+        }
+    }
+    strip_ctl_tags_in_place(content_out);
+    strip_ctl_tags_in_place(reasoning_out);
+}
+
+static bool parse_glm_generated_message_ex(const char *text,
+                                           bool require_thinking_closed,
+                                           char **content_out,
+                                           char **reasoning_out,
+                                           tool_calls *calls,
+                                           const tool_schema_orders *orders) {
+    if (!parse_glm_generated_message_raw(text, require_thinking_closed,
+                                         content_out, reasoning_out,
+                                         calls, orders)) return false;
+    glm_collect_marked_reasoning(content_out, reasoning_out);
     return true;
 }
 
@@ -6718,8 +6812,10 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    /* Bare text cannot tell a second reasoning pass from answer text until
+     * it ends, so it holds the answer.  Marked text sees the real tags. */
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools && !ctl->marked;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -6778,6 +6874,14 @@ static size_t think_close_hold(void) {
     return ctl->marked ? 0 : strlen(ctl->think_close) - 1;
 }
 
+/* A real <think> after the answer started opens another reasoning block (as
+ * in vLLM's GLM parser).  Only marked text can tell it from quoted prose. */
+static const char *marked_think_reopen(const char *s, const char *tool) {
+    if (!ctl->marked) return NULL;
+    const char *open = strstr(s, ctl->think_open);
+    return open && (!tool || open < tool) ? open : NULL;
+}
+
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
     if (len == 0) return true;
@@ -6788,7 +6892,7 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
     json_escape(&b, field);
     buf_putc(&b, ':');
-    json_escape_n(&b, text, len);
+    json_escape_visible_n(&b, text, len);
     buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
@@ -7617,6 +7721,20 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *reopen = marked_think_reopen(raw + st->emit_pos, tool);
+        if (reopen) {
+            const size_t limit = (size_t)(reopen - raw);
+            if (limit > st->emit_pos) {
+                if (!sse_chat_delta_n(fd, r, id, "content",
+                                      raw + st->emit_pos,
+                                      limit - st->emit_pos)) return false;
+                st->sent_content = true;
+            }
+            st->emit_pos = limit + strlen(ctl->think_open);
+            st->checked_think_prefix = true;
+            st->mode = OPENAI_STREAM_THINKING;
+            return openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, final);
+        }
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -7841,7 +7959,7 @@ static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
         "{\"type\":\"response.reasoning_summary_text.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"delta\":",
         st->reasoning_id, st->reasoning_index);
-    json_escape_n(&b, text, len);
+    json_escape_visible_n(&b, text, len);
     buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -7945,7 +8063,7 @@ static bool responses_sse_output_text_delta(int fd, responses_stream *st,
         "{\"type\":\"response.output_text.delta\","
         "\"item_id\":\"%s\",\"output_index\":%d,\"content_index\":0,\"delta\":",
         st->message_id, st->message_index);
-    json_escape_n(&b, text, len);
+    json_escape_visible_n(&b, text, len);
     buf_putc(&b, '}');
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -8257,7 +8375,10 @@ static bool responses_sse_stream_update(int fd, const request *r,
     /* The client only sees reasoning if it explicitly opted in via
      * reasoning.summary. Otherwise we still need to walk past <think>...</think>
      * to find the user-visible text, but we suppress the per-chunk emission. */
-    const bool emit_reasoning = r->reasoning_summary_emit;
+    /* A later reasoning block joins the reasoning item only if it is already
+     * open: items are not reopened behind the message. */
+    const bool emit_reasoning = r->reasoning_summary_emit &&
+        (st->reasoning_item_opened || !st->message_item_opened);
 
     if (st->mode == RESP_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
@@ -8315,7 +8436,8 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 if (!responses_sse_reasoning_delta(fd, st,
                                                    raw + st->emit_pos,
                                                    limit - st->emit_pos)) return false;
-                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
+                buf_append_visible(&st->reasoning_text, raw + st->emit_pos,
+                                   limit - st->emit_pos);
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
@@ -8343,8 +8465,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
     if (st->mode == RESP_STREAM_TEXT) {
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+        const char *reopen = marked_think_reopen(raw + st->emit_pos, tool);
+        size_t limit = reopen ? (size_t)(reopen - raw) :
+            text_stream_safe_limit(raw, st->emit_pos, raw_len, r->has_tools, final);
 
         if (limit > st->emit_pos) {
             if (!st->message_item_opened) {
@@ -8359,11 +8482,18 @@ static bool responses_sse_stream_update(int fd, const request *r,
             if (!responses_sse_output_text_delta(fd, st,
                                                  raw + st->emit_pos,
                                                  limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
+            buf_append_visible(&st->message_text, raw + st->emit_pos,
+                               limit - st->emit_pos);
             st->message_emitted_any = true;
             st->emit_pos = limit;
         }
 
+        if (reopen) {
+            st->emit_pos = limit + strlen(ctl->think_open);
+            st->checked_think_prefix = true;
+            st->mode = RESP_STREAM_THINKING;
+            return responses_sse_stream_update(fd, r, st, raw, raw_len, final);
+        }
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
             st->mode = RESP_STREAM_SUPPRESS;
@@ -8411,7 +8541,7 @@ static bool responses_sse_finish_live(int fd, const request *r,
             st->message_text_part_open = true;
         }
         if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
+        buf_append_visible(&st->message_text, tail, tail_len);
         st->message_emitted_any = true;
         st->emit_pos = raw_len;
     }
@@ -8723,8 +8853,10 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    /* Bare text cannot tell a second reasoning pass from answer text until
+     * it ends, so it holds the answer.  Marked text sees the real tags. */
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools && !ctl->marked;
     return ok;
 }
 
@@ -8832,14 +8964,14 @@ static bool anthropic_sse_delta_live(int fd, const anthropic_stream *st,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":",
                    st->next_index);
-        json_escape_n(&b, text, len);
+        json_escape_visible_n(&b, text, len);
         buf_puts(&b, "}}");
     } else {
         buf_printf(&b,
                    "{\"type\":\"content_block_delta\",\"index\":%d,"
                    "\"delta\":{\"type\":\"text_delta\",\"text\":",
                    st->next_index);
-        json_escape_n(&b, text, len);
+        json_escape_visible_n(&b, text, len);
         buf_puts(&b, "}}");
     }
     bool ok = sse_event(fd, "content_block_delta", b.ptr);
@@ -9253,6 +9385,22 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *reopen = marked_think_reopen(raw + st->emit_pos, tool);
+        if (reopen) {
+            const size_t limit = (size_t)(reopen - raw);
+            if (limit > st->emit_pos) {
+                if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+                if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
+                                              raw + st->emit_pos,
+                                              limit - st->emit_pos)) return false;
+                st->sent_text = true;
+            }
+            if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+            st->emit_pos = limit + strlen(ctl->think_open);
+            st->checked_think_prefix = true;
+            st->mode = ANTH_STREAM_THINKING;
+            return anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, final);
+        }
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -13745,6 +13893,14 @@ decode_again:
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure, &j->req.tool_orders);
+        if (ctl->marked && j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM &&
+            text.ptr && strstr(text.ptr, ctl->think_open)) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s model opened another reasoning block; routed to reasoning",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags);
+        }
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -20955,6 +21111,23 @@ static void test_marked_glm_parse_literal_tags_are_text(void) {
     tool_calls_free(&calls);
 }
 
+static void test_marked_glm_parse_second_block_and_stray_tags(void) {
+    const char *generated =
+        "R1" DS4_CTL "<think>" " nested" DS4_CTL "</think>"
+        "A1 " DS4_CTL "<think>" "R2" DS4_CTL "</think>"
+        "A2" DS4_CTL "</think>" " A3";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, generated, true, &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "R1 nestedR2"));
+    TEST_ASSERT(content && !strcmp(content, "A1 A2 A3"));
+    TEST_ASSERT(!test_has_marker(content) && !test_has_marker(reasoning));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_marked_glm_parse_tool_calls(void) {
     /* A real tool call inside unclosed reasoning ends the reasoning. */
     const char *generated =
@@ -20978,6 +21151,24 @@ static void test_marked_glm_parse_tool_calls(void) {
     tool_calls_free(&calls);
 }
 
+static void test_marked_glm_parse_later_reasoning_before_tool_call(void) {
+    const char *after =
+        "R1" DS4_CTL "</think>" "Let me check." DS4_CTL "<think>" "R2" DS4_CTL "</think>"
+        "\n\n" DS4_CTL "<tool_call>" "bash"
+        DS4_CTL "<arg_key>" "command" DS4_CTL "</arg_key>"
+        DS4_CTL "<arg_value>" "pwd" DS4_CTL "</arg_value>" DS4_CTL "</tool_call>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, after, true, &content, &reasoning, &calls, NULL));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "R1R2"));
+    TEST_ASSERT(content && !strcmp(content, "Let me check."));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_marked_glm_raw_tool_text_follows_spelling(void) {
     TEST_ASSERT(glm_raw_tool_text_usable("\n\n" DS4_CTL "<tool_call>x"));
     TEST_ASSERT(!glm_raw_tool_text_usable("\n\n<tool_call>x"));
@@ -20985,6 +21176,120 @@ static void test_marked_glm_raw_tool_text_follows_spelling(void) {
     TEST_ASSERT(glm_raw_tool_text_usable("\n\n<tool_call>x"));
     TEST_ASSERT(!glm_raw_tool_text_usable("\n\n" DS4_CTL "<tool_call>x"));
     server_ctl_set_marked(true);
+}
+
+static void test_marked_glm_openai_stream_does_not_hold_answer(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    TEST_ASSERT(!st.guard_second_reasoning);
+    const char *partial = "why </think> not yet" DS4_CTL "</think>" "The answer </think> is <b>4</b>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_marked",
+                                         &st, partial, strlen(partial), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"why </think> not yet\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"The answer </think> is <b>4</b>\"") != NULL);
+    TEST_ASSERT(!test_has_marker(out));
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_marked_glm_openai_stream_second_block(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *partial = "R1" DS4_CTL "</think>" "A1" DS4_CTL "<think>" "R2";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_marked2",
+                                         &st, partial, strlen(partial), false));
+    const char *complete =
+        "R1" DS4_CTL "</think>" "A1" DS4_CTL "<think>" "R2" DS4_CTL "<think>" "R3"
+        DS4_CTL "</think>" "A2" DS4_CTL "</think>" "A3";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_marked2",
+                                       &st, complete, strlen(complete), NULL,
+                                       "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"R1\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"A1\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"R2\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"R3\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"A2A3\"") != NULL);
+    TEST_ASSERT(strstr(out, "think>") == NULL);
+    TEST_ASSERT(!test_has_marker(out));
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_marked_glm_anthropic_stream_second_block(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_marked", 5, &st));
+    TEST_ASSERT(!st.guard_second_reasoning);
+    const char *raw =
+        "R1" DS4_CTL "</think>" "A1" DS4_CTL "<think>" "R2" DS4_CTL "</think>" "A2";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_marked",
+                                            &st, raw, strlen(raw), false));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_marked",
+                                          &st, raw, strlen(raw), NULL, "stop", 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *t1 = strstr(out, "\"thinking\":\"R1\"");
+    const char *a1 = strstr(out, "\"text\":\"A1\"");
+    const char *t2 = strstr(out, "\"thinking\":\"R2\"");
+    const char *a2 = strstr(out, "\"text\":\"A2\"");
+    TEST_ASSERT(t1 && a1 && t2 && a2 && t1 < a1 && a1 < t2 && t2 < a2);
+    TEST_ASSERT(strstr(out, "think>") == NULL);
+    TEST_ASSERT(!test_has_marker(out));
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
 }
 
 static void test_marked_glm_trackers_ignore_tag_text(void) {
@@ -21017,16 +21322,29 @@ static void test_marked_json_escape_drops_markers(void) {
     buf_free(&b);
 }
 
+static void test_marked_visible_text_drops_real_tags(void) {
+    buf b = {0};
+    json_escape_visible_n(&b, "x" DS4_CTL "</think>" "y", strlen("x" DS4_CTL "</think>" "y"));
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, "\"xy\""));
+    buf_free(&b);
+}
+
 static void test_marked_glm_chat_text(void) {
     server_ctl_set_marked(true);
     test_marked_glm_render_template_tags();
     test_marked_glm_render_keeps_content_tags_as_text();
     test_marked_glm_render_inline_think_history();
     test_marked_glm_parse_literal_tags_are_text();
+    test_marked_glm_parse_second_block_and_stray_tags();
     test_marked_glm_parse_tool_calls();
+    test_marked_glm_parse_later_reasoning_before_tool_call();
     test_marked_glm_raw_tool_text_follows_spelling();
+    test_marked_glm_openai_stream_does_not_hold_answer();
+    test_marked_glm_openai_stream_second_block();
+    test_marked_glm_anthropic_stream_second_block();
     test_marked_glm_trackers_ignore_tag_text();
     test_marked_json_escape_drops_markers();
+    test_marked_visible_text_drops_real_tags();
     server_ctl_set_marked(false);
 }
 

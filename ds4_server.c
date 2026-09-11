@@ -21643,6 +21643,57 @@ static void test_marked_glm_stream_late_answer(void) {
     close(sv[1]);
 }
 
+/* A GLM tool call streams nothing until it parses; a long file write must
+ * still keep the connection alive (clients drop a stream after 300 s idle). */
+static void test_marked_glm_stream_keepalive_during_tool_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *steps[] = {
+        "why" DS4_CTL "</think>" "Writing the file.",
+        "why" DS4_CTL "</think>" "Writing the file." DS4_CTL "<tool_call>" "write"
+            DS4_CTL "<arg_key>" "content" DS4_CTL "</arg_key>" DS4_CTL "<arg_value>",
+        "why" DS4_CTL "</think>" "Writing the file." DS4_CTL "<tool_call>" "write"
+            DS4_CTL "<arg_key>" "content" DS4_CTL "</arg_key>" DS4_CTL "<arg_value>"
+            "body { color: red }",
+    };
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "id", &st,
+                                             steps[i], strlen(steps[i]), false));
+    }
+    TEST_ASSERT(st.mode == OPENAI_STREAM_SUPPRESS);
+    TEST_ASSERT(st.last_wire != 0.0);
+    st.last_wire -= SSE_WITHHELD_KEEPALIVE_SEC + 1.0;
+    const char *last = steps[2];
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "id", &st,
+                                         last, strlen(last), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *ka = strstr(out, ": generating\n\n");
+    TEST_ASSERT(ka != NULL && strstr(ka + 1, ": generating\n\n") == NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"Writing the file.\"") != NULL);
+    TEST_ASSERT(strstr(out, "tool_call") == NULL && strstr(out, "color") == NULL);
+    TEST_ASSERT(!test_has_marker(out));
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_marked_glm_trackers_ignore_tag_text(void) {
     thinking_state th = {0};
     th.inside = true;
@@ -21695,6 +21746,7 @@ static void test_marked_glm_chat_text(void) {
     test_marked_glm_openai_stream_second_block();
     test_marked_glm_anthropic_stream_second_block();
     test_marked_glm_stream_late_answer();
+    test_marked_glm_stream_keepalive_during_tool_call();
     test_marked_glm_trackers_ignore_tag_text();
     test_marked_json_escape_drops_markers();
     test_marked_visible_text_drops_real_tags();

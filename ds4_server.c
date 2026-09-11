@@ -12702,10 +12702,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
+    bool text_rewound = false;
     if (text_rewind > 0) {
         cached = live_text_rewind_prompt(s, slot, &j->req, text_rewind,
                                          text_rewind_bytes, &effective_prompt);
         if (cached > 0) {
+            text_rewound = true;
             cache_source = "memory-text-rewind";
             prompt_for_sync = &effective_prompt;
             cache_diag.rewind_to = cached;
@@ -12814,7 +12816,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    /* A text rewind may keep only a scrap shared with another conversation,
+     * such as the first template tokens.  The new prompt's stable prefix still
+     * needs its cold checkpoint, or every independent session sharing that
+     * prefix (agent subsessions) would prefill it again. */
+    if (!multimodal && (cached == 0 || text_rewound) &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -12825,6 +12831,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (cold_store_len <= cached) cold_store_len = 0;
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {

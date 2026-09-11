@@ -9328,6 +9328,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Prompt tokens synced by the request that produced the live session;
+     * everything after them is that request's own output.  0 if unknown. */
+    int live_prompt_end;
 
     job *assigned;
     job *running;
@@ -10723,6 +10726,23 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     return loaded;
 }
 
+/* Tokens the best disk snapshot would restore for this prompt, without
+ * loading it. */
+static int kv_cache_best_text_prefix_tokens(server *s, server_slot *slot,
+                                            const request *req) {
+    if (!s || !slot || !s->kv.enabled || !req || !req->prompt_text) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    pthread_mutex_lock(&s->kv_mu);
+    const int idx = ds4_kvstore_find_text_prefix(&s->kv, req->prompt_text,
+                                                 ds4_engine_model_id(s->engine),
+                                                 quant_bits,
+                                                 ds4_session_ctx(slot->session));
+    const int tokens = idx >= 0 ? (int)s->kv.entry[idx].tokens : 0;
+    pthread_mutex_unlock(&s->kv_mu);
+    return tokens;
+}
+
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
@@ -10810,6 +10830,86 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
                                        effective_prompt);
     free(live_text);
     return ok ? live_tokens->len : 0;
+}
+
+/* Cut a partial live text match back so the prompt keeps a non-empty suffix,
+ * leaving at least one token to evaluate for fresh logits, and so the suffix
+ * does not start inside a UTF-8 character.  ends[i] is the byte offset just
+ * past live token i in the rendered text. */
+static int live_text_rewind_backoff(const size_t *ends, int keep,
+                                    const char *text, size_t text_len) {
+    while (keep > 0) {
+        const size_t at = ends[keep - 1];
+        if (at < text_len && ((unsigned char)text[at] & 0xc0) != 0x80) break;
+        keep--;
+    }
+    return keep;
+}
+
+/* An interrupted turn leaves sampled tokens that the next request never
+ * replays: clients drop an unfinished reasoning-only turn, or resend only the
+ * part of an answer they received before the stop.  The prompt then diverges
+ * inside the live checkpoint, so neither the exact token prefix nor the
+ * whole-checkpoint text prefix matches.  Find the most live tokens whose
+ * rendered text is a byte prefix of the prompt; the sampled tokenization of
+ * earlier turns may differ from the prompt's, so tokens are compared as text. */
+static int live_text_rewind_point(server *s, server_slot *slot,
+                                  const request *req, size_t *bytes_out) {
+    *bytes_out = 0;
+    if (!s || !slot || !req || !req->prompt_text) return 0;
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    if (!live || live->len <= 0) return 0;
+    const char *text = req->prompt_text;
+    const size_t text_len = strlen(text);
+    size_t *ends = xmalloc((size_t)live->len * sizeof(ends[0]));
+    size_t off = 0;
+    int keep = 0;
+    while (keep < live->len) {
+        size_t len = 0;
+        char *piece = ds4_token_text(s->engine, live->v[keep], &len);
+        /* A token that renders to nothing cannot be matched against the
+         * prompt, so it must not be kept on the strength of other bytes. */
+        const bool same = len > 0 && len <= text_len - off &&
+                          !memcmp(piece, text + off, len);
+        free(piece);
+        if (!same) break;
+        off += len;
+        ends[keep++] = off;
+    }
+    keep = live_text_rewind_backoff(ends, keep, text, text_len);
+    *bytes_out = keep > 0 ? ends[keep - 1] : 0;
+    free(ends);
+    return keep;
+}
+
+/* True when a live text rewind discards only what the previous request
+ * generated, plus the assistant header its prompt ended with (a client that
+ * drops the unfinished turn renders that header differently).  Saving that
+ * tail to disk is wasted work: no later prompt contains output the client
+ * never received or chose to drop. */
+static bool live_rewind_drops_only_output(int keep, int prev_prompt_end) {
+    const int header_slack = 16;
+    return keep > 0 && prev_prompt_end > 0 &&
+           keep + header_slack >= prev_prompt_end;
+}
+
+/* Rewind the live session to keep tokens and continue with the prompt bytes
+ * that follow them.  Returns the reused token count, or 0 when the backend
+ * could not roll its state back to that position. */
+static int live_text_rewind_prompt(server *s, server_slot *slot,
+                                   const request *req, int keep,
+                                   size_t keep_bytes,
+                                   ds4_tokens *effective_prompt) {
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewind(slot->session, keep);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!build_live_prompt_suffix(s, slot, req, req->prompt_text + keep_bytes,
+                                  effective_prompt)) return 0;
+    pthread_mutex_lock(&s->inference_mu);
+    const bool valid =
+        ds4_session_common_prefix(slot->session, effective_prompt) == keep;
+    pthread_mutex_unlock(&s->inference_mu);
+    return valid ? keep : 0;
 }
 
 /* Tool-output-only Responses continuation.
@@ -12437,6 +12537,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
+    const int prev_prompt_end = slot->live_prompt_end;
+    slot->live_prompt_end = 0;
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
@@ -12561,6 +12663,23 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* A GLM checkpoint can be cut back to any token.  When the prompt diverges
+     * inside it, as after an interrupted turn, keep the longest live text
+     * prefix instead of prefilling from token 0, unless a disk snapshot
+     * restores more. */
+    int text_rewind = 0;
+    size_t text_rewind_bytes = 0;
+    if (cached == 0 && !multimodal && live_vision_match &&
+        ds4_engine_is_glm_dsa(s->engine))
+    {
+        text_rewind = live_text_rewind_point(s, slot, &j->req,
+                                             &text_rewind_bytes);
+        if (text_rewind > 0 &&
+            kv_cache_best_text_prefix_tokens(s, slot, &j->req) > text_rewind)
+        {
+            text_rewind = 0;
+        }
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
@@ -12576,11 +12695,28 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+        old_pos >= s->kv.opt.min_tokens &&
+        !live_rewind_drops_only_output(text_rewind, prev_prompt_end)) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
+    }
+    if (text_rewind > 0) {
+        cached = live_text_rewind_prompt(s, slot, &j->req, text_rewind,
+                                         text_rewind_bytes, &effective_prompt);
+        if (cached > 0) {
+            cache_source = "memory-text-rewind";
+            prompt_for_sync = &effective_prompt;
+            cache_diag.rewind_to = cached;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewound GLM live text prefix from %d to %d tokens",
+                       old_pos, cached);
+        } else {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: GLM live text rewind from %d to %d requires rebuild",
+                       old_pos, text_rewind);
+        }
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -12769,6 +12905,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&effective_prompt);
         return;
     }
+    slot->live_prompt_end = prompt_for_sync->len;
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
@@ -18783,6 +18920,32 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
+static void test_live_text_rewind_backoff(void) {
+    /* Live "ab" "c" "d" against a prompt that diverges at the third token. */
+    const size_t ends[] = {2, 3, 4};
+    TEST_ASSERT(live_text_rewind_backoff(ends, 2, "abcxyz", 6) == 2);
+    /* A fully covered prompt keeps its last token for fresh logits. */
+    TEST_ASSERT(live_text_rewind_backoff(ends, 2, "abc", 3) == 1);
+    TEST_ASSERT(live_text_rewind_backoff(ends, 1, "ab", 2) == 0);
+    /* Never leave a suffix that starts inside a UTF-8 character: live "a"
+     * "\xc3" (half of an e-acute) must fall back to just "a". */
+    const size_t utf8_ends[] = {1, 2};
+    TEST_ASSERT(live_text_rewind_backoff(utf8_ends, 2, "a\xc3\xa9Z", 4) == 1);
+    TEST_ASSERT(live_text_rewind_backoff(utf8_ends, 0, "a\xc3\xa9Z", 4) == 0);
+}
+
+static void test_live_rewind_drops_only_output(void) {
+    /* Dropped unfinished turn: the cut lands on the assistant header. */
+    TEST_ASSERT(live_rewind_drops_only_output(998, 1000));
+    /* Partial answer resent: the cut lands inside the generated output. */
+    TEST_ASSERT(live_rewind_drops_only_output(1500, 1000));
+    /* History edited earlier in the prompt: keep the evict snapshot. */
+    TEST_ASSERT(!live_rewind_drops_only_output(500, 1000));
+    /* Unknown previous prompt, or no rewind at all. */
+    TEST_ASSERT(!live_rewind_drops_only_output(998, 0));
+    TEST_ASSERT(!live_rewind_drops_only_output(0, 1000));
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -20491,6 +20654,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_live_text_rewind_backoff();
+    test_live_rewind_drops_only_output();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
